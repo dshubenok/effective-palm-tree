@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from itertools import islice
 from typing import AsyncIterator, Iterable, Sequence
 
@@ -17,13 +16,6 @@ from .config import ClickHouseSettings
 
 class ClickHouseSaverError(Exception):
     """Raised when persisting data to ClickHouse fails."""
-
-
-@dataclass(slots=True)
-class RepositorySnapshot:
-    measured_at: datetime
-    repository: Repository
-    position: int
 
 
 class ClickHouseSaver:
@@ -68,65 +60,75 @@ class ClickHouseSaver:
     async def save_top_repositories(
         self,
         repositories: Sequence[Repository],
-        measured_at: datetime,
+        updated_at: datetime,
     ) -> None:
         if not repositories:
             return
 
         await self._ensure_client()
-        snapshots = [
-            RepositorySnapshot(
-                measured_at=measured_at,
-                repository=repo,
-                position=index,
-            )
-            for index, repo in enumerate(repositories, start=1)
-        ]
+        measurement_date = updated_at.date()
 
-        await self._insert_repositories(snapshots)
-        await self._insert_rankings(snapshots)
-        await self._insert_author_commits(snapshots)
+        await self._insert_repositories(repositories, updated_at)
+        await self._insert_positions(repositories, measurement_date)
+        await self._insert_author_commits(repositories, measurement_date)
 
-    async def _insert_repositories(self, snapshots: Sequence[RepositorySnapshot]) -> None:
+    async def _insert_repositories(
+        self,
+        repositories: Sequence[Repository],
+        updated_at: datetime,
+    ) -> None:
         rows = (
             (
-                snapshot.measured_at,
-                snapshot.repository.full_name,
-                snapshot.repository.name,
-                snapshot.repository.html_url,
-                snapshot.repository.stargazers_count,
-                snapshot.repository.forks_count,
+                repo.name,
+                repo.owner,
+                repo.stars,
+                repo.watchers,
+                repo.forks,
+                repo.language,
+                updated_at,
             )
-            for snapshot in snapshots
+            for repo in repositories
         )
-        columns = "measured_at, full_name, name, html_url, stargazers_count, forks_count"
+        columns = "name, owner, stars, watchers, forks, language, updated"
         await self._insert_with_batches(self._settings.repositories_table, columns, rows)
 
-    async def _insert_rankings(self, snapshots: Sequence[RepositorySnapshot]) -> None:
+    async def _insert_positions(
+        self,
+        repositories: Sequence[Repository],
+        measurement_date: date,
+    ) -> None:
         rows = (
             (
-                snapshot.measured_at,
-                snapshot.repository.full_name,
-                snapshot.position,
+                measurement_date,
+                self._format_repo_identifier(repo),
+                repo.position if repo.position > 0 else index,
             )
-            for snapshot in snapshots
+            for index, repo in enumerate(repositories, start=1)
         )
-        columns = "measured_at, full_name, position"
-        await self._insert_with_batches(self._settings.rankings_table, columns, rows)
+        columns = "date, repo, position"
+        await self._insert_with_batches(self._settings.positions_table, columns, rows)
 
-    async def _insert_author_commits(self, snapshots: Sequence[RepositorySnapshot]) -> None:
+    async def _insert_author_commits(
+        self,
+        repositories: Sequence[Repository],
+        measurement_date: date,
+    ) -> None:
         rows = (
             (
-                snapshot.measured_at,
-                snapshot.repository.full_name,
+                measurement_date,
+                self._format_repo_identifier(repo),
                 author.author,
-                author.commits,
+                author.commits_num,
             )
-            for snapshot in snapshots
-            for author in snapshot.repository.authors_commits_num_today
+            for repo in repositories
+            for author in repo.authors_commits_num_today
         )
-        columns = "measured_at, full_name, author, commits"
-        await self._insert_with_batches(self._settings.author_commits_table, columns, rows)
+        columns = "date, repo, author, commits_num"
+        await self._insert_with_batches(self._settings.authors_commits_table, columns, rows)
+
+    @staticmethod
+    def _format_repo_identifier(repository: Repository) -> str:
+        return f"{repository.owner}/{repository.name}"
 
     async def _insert_with_batches(
         self,

@@ -1,39 +1,38 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 from datetime import datetime, timedelta, timezone
-from typing import Any, AsyncIterator, Sequence
+from typing import Any, Final
 
-import httpx
+from aiohttp import ClientError, ClientResponseError, ClientSession
 
-from .config import GithubSettings
-from .models import AuthorCommits, Repository
+from .models import Repository, RepositoryAuthorCommitsNum
 from .rate_limiter import RateLimiter
 
-
-class GithubScrapperError(RuntimeError):
-    """Base exception for GithubReposScrapper errors."""
+GITHUB_API_BASE_URL: Final[str] = "https://api.github.com"
 
 
 class GithubReposScrapper:
-    def __init__(self, settings: GithubSettings | None = None) -> None:
-        self._settings = settings or GithubSettings()
-        self._semaphore = asyncio.Semaphore(self._settings.max_concurrent_requests)
-        self._rate_limiter = RateLimiter(self._settings.requests_per_second)
+    def __init__(
+        self,
+        access_token: str,
+        *,
+        max_concurrent_requests: int = 5,
+        requests_per_second: int = 10,
+    ) -> None:
+        if max_concurrent_requests <= 0:
+            raise ValueError("max_concurrent_requests must be positive")
+        if requests_per_second <= 0:
+            raise ValueError("requests_per_second must be positive")
         headers = {
-            "Accept": "application/vnd.github+json",
+            "Accept": "application/vnd.github.v3+json",
+            "Authorization": f"Bearer {access_token}",
             "User-Agent": "effective-palm-tree-scrapper",
         }
-        if self._settings.token:
-            headers["Authorization"] = f"Bearer {self._settings.token.get_secret_value()}"
-        self._client = httpx.AsyncClient(
-            base_url=str(self._settings.api_base_url),
-            headers=headers,
-            timeout=httpx.Timeout(self._settings.timeout),
-        )
-
-    async def close(self) -> None:
-        await self._client.aclose()
+        self._session = ClientSession(headers=headers)
+        self._semaphore = asyncio.Semaphore(max_concurrent_requests)
+        self._rate_limiter = RateLimiter(requests_per_second)
 
     async def __aenter__(self) -> "GithubReposScrapper":
         return self
@@ -41,73 +40,101 @@ class GithubReposScrapper:
     async def __aexit__(self, exc_type, exc, tb) -> None:
         await self.close()
 
-    async def get_repositories(self, repositories: Sequence[str]) -> list[Repository]:
-        tasks = [self._fetch_repository(name) for name in repositories]
+    async def close(self) -> None:
+        if not self._session.closed:
+            await self._session.close()
+
+    async def get_repositories(self, limit: int = 100) -> list[Repository]:
+        repositories = await self._get_top_repositories(limit=limit)
+        since = datetime.now(timezone.utc) - timedelta(days=1)
+
+        tasks = [
+            self._build_repository_snapshot(position, repo, since)
+            for position, repo in enumerate(repositories, start=1)
+        ]
         if not tasks:
             return []
         return await asyncio.gather(*tasks)
 
-    async def _fetch_repository(self, repo_full_name: str) -> Repository:
-        repo_data = await self._get_json(f"/repos/{repo_full_name}")
-        authors = await self._fetch_authors_commits(repo_full_name)
+    async def _make_request(
+        self,
+        endpoint: str,
+        method: str = "GET",
+        params: dict[str, Any] | None = None,
+    ) -> Any:
+        url = f"{GITHUB_API_BASE_URL}/{endpoint}"
+        try:
+            async with self._semaphore:
+                await self._rate_limiter.acquire()
+                async with self._session.request(method, url, params=params) as response:
+                    response.raise_for_status()
+                    return await response.json()
+        except ClientResponseError as exc:
+            text = exc.message or "GitHub API request failed"
+            raise RuntimeError(f"{method} {url} failed with status {exc.status}: {text}") from exc
+        except ClientError as exc:
+            raise RuntimeError(f"Network error during {method} {url}") from exc
+
+    async def _get_top_repositories(self, limit: int = 100) -> list[dict[str, Any]]:
+        data = await self._make_request(
+            endpoint="search/repositories",
+            params={"q": "stars:>1", "sort": "stars", "order": "desc", "per_page": limit},
+        )
+        items = data.get("items")
+        if not isinstance(items, list):
+            raise RuntimeError("GitHub API returned unexpected payload for repositories search")
+        return items
+
+    async def _get_repository_commits(
+        self,
+        owner: str,
+        repo: str,
+        since: datetime,
+    ) -> list[dict[str, Any]]:
+        params = {
+            "since": since.isoformat(timespec="seconds"),
+            "per_page": 100,
+        }
+        data = await self._make_request(
+            endpoint=f"repos/{owner}/{repo}/commits",
+            params=params,
+        )
+        if not isinstance(data, list):
+            raise RuntimeError("GitHub API returned unexpected payload for repository commits")
+        return data
+
+    async def _build_repository_snapshot(
+        self,
+        position: int,
+        repo: dict[str, Any],
+        since: datetime,
+    ) -> Repository:
+        owner = repo["owner"]["login"]
+        name = repo["name"]
+        commits = await self._get_repository_commits(owner=owner, repo=name, since=since)
+        authors = self._aggregate_commits(commits)
         return Repository(
-            name=repo_data["name"],
-            full_name=repo_data["full_name"],
-            html_url=repo_data["html_url"],
-            stargazers_count=repo_data.get("stargazers_count", 0),
-            forks_count=repo_data.get("forks_count", 0),
+            name=name,
+            owner=owner,
+            position=position,
+            stars=repo.get("stargazers_count", 0),
+            watchers=repo.get("watchers_count") or repo.get("watchers", 0),
+            forks=repo.get("forks_count", 0),
+            language=repo.get("language") or "",
             authors_commits_num_today=authors,
         )
 
-    async def _fetch_authors_commits(self, repo_full_name: str) -> list[AuthorCommits]:
-        since = datetime.now(timezone.utc) - timedelta(days=1)
-        params = {"since": since.isoformat(timespec="seconds"), "per_page": self._settings.commits_page_size}
-
-        authors: dict[str, int] = {}
-        async for commit in self._iterate_commits(repo_full_name, params):
-            author_login = self._extract_author(commit)
-            if not author_login:
-                continue
-            authors[author_login] = authors.get(author_login, 0) + 1
-
-        return [AuthorCommits(author=author, commits=count) for author, count in authors.items()]
-
-    async def _iterate_commits(self, repo_full_name: str, params: dict[str, Any]) -> AsyncIterator[dict[str, Any]]:
-        next_url: str | None = f"/repos/{repo_full_name}/commits"
-        next_params = params
-        while next_url:
-            response = await self._request(next_url, params=next_params)
-            data = response.json()
-            for item in data:
-                yield item
-
-            link = response.links.get("next")
-            next_url = link["url"] if link else None
-            next_params = None
-
-    async def _request(self, url: str, params: dict[str, Any] | None = None) -> httpx.Response:
-        async with self._semaphore:
-            await self._rate_limiter.acquire()
-            try:
-                response = await self._client.get(url, params=params)
-            except httpx.HTTPError as exc:
-                raise GithubScrapperError(f"HTTP error while requesting {url}") from exc
-
-        if response.status_code == httpx.codes.OK:
-            return response
-        if response.status_code == httpx.codes.NOT_FOUND:
-            raise GithubScrapperError(f"Resource not found: {url}")
-        if response.status_code == httpx.codes.FORBIDDEN:
-            raise GithubScrapperError("Access forbidden by GitHub API")
-        if response.status_code == httpx.codes.UNPROCESSABLE_ENTITY:
-            raise GithubScrapperError(f"Unprocessable entity for request {url}")
-
-        raise GithubScrapperError(
-            f"Unexpected status {response.status_code} for request {url}: {response.text}"
-        )
-
-    async def _get_json(self, url: str, params: dict[str, Any] | None = None) -> Any:
-        return (await self._request(url, params=params)).json()
+    @staticmethod
+    def _aggregate_commits(commits: list[dict[str, Any]]) -> list[RepositoryAuthorCommitsNum]:
+        authors = Counter()
+        for commit in commits:
+            author = GithubReposScrapper._extract_author(commit)
+            if author:
+                authors[author] += 1
+        return [
+            RepositoryAuthorCommitsNum(author=author, commits_num=count)
+            for author, count in authors.most_common()
+        ]
 
     @staticmethod
     def _extract_author(commit: dict[str, Any]) -> str | None:
@@ -120,5 +147,4 @@ class GithubReposScrapper:
         name = commit_author.get("name")
         if name:
             return name
-        email = commit_author.get("email")
-        return email
+        return commit_author.get("email")

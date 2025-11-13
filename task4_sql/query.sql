@@ -1,20 +1,33 @@
--- Возвращает просмотры по поисковым фразам по часам за сегодня
+-- Считает почасовые просмотры (приросты cumulative) по поисковым запросам
+WITH phrases AS (
+    SELECT
+        phrase,
+        campaign_id,
+        toStartOfHour(dt) AS hour_ts,
+        max(views) AS cumulative_views
+    FROM phrases_views
+    WHERE dt >= date_trunc('day', now()) -- сегодня
+      AND campaign_id = {campaign_id:Int32}
+    GROUP BY phrase, campaign_id, hour_ts
+),
+diffs AS (
+    SELECT
+        phrase,
+        campaign_id,
+        hour_ts,
+        cumulative_views - lag(cumulative_views, 1, 0)
+            OVER (PARTITION BY phrase, campaign_id ORDER BY hour_ts) AS hour_views
+    FROM phrases
+)
 SELECT
     phrase,
     arraySort(
         x -> -x.1,
-        groupArray((hour, views_count))
+        arrayFilter(
+            x -> x.2 > 0,
+            groupArray((toHour(hour_ts), hour_views))
+        )
     ) AS views_by_hour
-FROM
-(
-    SELECT
-        phrase,
-        toHour(event_time) AS hour,
-        sum(views) AS views_count
-    FROM search_phrase_views
-    WHERE campaign_id = {campaign_id:UInt64}
-      AND toDate(event_time) = today()
-    GROUP BY phrase, hour
-)
+FROM diffs
 GROUP BY phrase
 ORDER BY phrase;

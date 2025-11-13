@@ -1,20 +1,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
 
 
-@dataclass(frozen=True, slots=True)
-class AuthorCommits:
+@dataclass(slots=True)
+class RepositoryAuthorCommitsNum:
     author: str
-    commits: int
+    commits_num: int
 
 
 @dataclass(slots=True)
 class Repository:
     name: str
-    full_name: str
-    html_url: str
-    stargazers_count: int
-    forks_count: int
-    authors_commits_num_today: Sequence[AuthorCommits]
+    owner: str
+    position: int
+    stars: int
+    watchers: int
+    forks: int
+    language: str
+    authors_commits_num_today: list[RepositoryAuthorCommitsNum]
